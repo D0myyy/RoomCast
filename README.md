@@ -18,25 +18,6 @@ npx serve .
 Open `http://localhost:8080`. Use two browser tabs/windows to try host + viewer side-by-side.
 Screen sharing requires a **desktop Chromium browser** (Chrome, Edge, Brave, Opera) over **https or localhost** — Firefox/Safari can share video but only some support system audio.
 
-## Publish to GitHub Pages
-
-1. Create a repo on GitHub (any name, e.g. `roomcast`).
-2. Push this folder to the `main` branch:
-
-   ```bash
-   git init
-   git add .
-   git commit -m "RoomCast screen sharing app"
-   git branch -M main
-   git remote add origin https://github.com/<you>/<repo>.git
-   git push -u origin main
-   ```
-
-3. In the repo: **Settings → Pages → Build and deployment → Source: Deploy from a branch → Branch: `main` / `(root)` → Save**.
-4. In ~1 minute your site is live at `https://<you>.github.io/<repo>/`.
-
-That's it — no build step, no backend, no environment variables.
-
 ## How it works
 
 | Piece | Where |
