@@ -1,7 +1,9 @@
 /* ============================================================
    RoomCast — WebRTC screen sharing with audio, PeerJS signaling
-   Owner: creates a room, shares screen(+system audio & mic) to viewers.
-   Viewer: joins with a code, can send camera+mic back (two-way talk).
+   Owner: creates a room, shares screen(+system audio & mic) to viewers,
+          optional own webcam (sent as picture-in-picture to viewers).
+   Viewer: joins with a code; mic for talk, camera entirely optional —
+          no camera means no self-video tile at all (never a black box).
    ============================================================ */
 "use strict";
 
@@ -17,7 +19,7 @@ function toast(msg, kind = "") {
   el.className = "toast " + kind;
   el.textContent = msg;
   $("toastHost").appendChild(el);
-  setTimeout(() => el.remove(), 4200);
+  setTimeout(() => el.remove(), 6000);
 }
 
 function fmtTime(s) {
@@ -33,11 +35,14 @@ const state = {
   roomCode: null,
   rejoinCode: null,
   name: "",
-  screenStream: null,       // owner outgoing screen (+screen audio + mic)
+  screenStream: null,       // owner outgoing screen (+system audio + mic)
   micTrack: null,
-  answeredCalls: new Map(), // owner: peerId -> media call
-  ownStream: null,          // viewer outgoing cam+mic
-  call: null,               // viewer: media call to host
+  ownerCamStream: null,     // owner's local webcam (self-view + PiP to viewers)
+  hostCamCalls: new Map(),  // owner: viewerPeerId -> media call carrying the webcam
+  answeredCalls: new Map(), // owner: peerId -> media call (viewer -> host screen call)
+  ownStream: null,          // viewer outgoing mic (+ optional cam)
+  call: null,               // viewer: media call to host (screen)
+  hostCamCall: null,        // viewer: media call receiving host webcam
   dataConn: null,           // viewer data connection
   dataConns: new Map(),     // owner: peerId -> data connection
   timerInt: null,
@@ -77,32 +82,34 @@ function startPeer(code, role) {
   const peer = role === "owner" ? new Peer("RoomCast-" + code, peerConfig) : new Peer(peerConfig);
   state.peer = peer;
 
-  peer.on("open", () => { console.log("[peer] open", peer.id); enterRoomUI(); });
-  peer.on("disconnected", () => { console.log("[peer] disconnected, reconnecting"); try { peer.reconnect(); } catch (_) {} });
+  peer.on("open", () => enterRoomUI());
+  peer.on("disconnected", () => { try { peer.reconnect(); } catch (_) {} });
   peer.on("error", (err) => {
     console.error("[peer] error:", err.type, err);
     teardown();
     if (err.type === "unavailable-id") {
       show("lobby");
       toast("That code is already in use — generating a new one…", "warn");
-      if (role === "owner") state.rejoinCode = null, setTimeout(() => startPeer(genCode(), "owner"), 400);
+      if (role === "owner") { state.rejoinCode = null; setTimeout(() => startPeer(genCode(), "owner"), 400); }
     } else if (err.type === "peer-unavailable") {
       show("lobby");
       toast("Room not found — check the code.", "warn");
     } else {
       show("ended");
       $("endedTitle").textContent = "Connection error";
-    $("endedSub").textContent = "Signaling problem — type [" + (err.type || "unknown") + "]";
+      $("endedSub").textContent = "Signaling problem — type [" + (err.type || "unknown") + "]";
     }
   });
 
   if (role === "owner") wireOwnerHandlers(peer);
+  else wireViewerCallHandlers(peer);
 }
 
 /* ============================================================
    OWNER
    ============================================================ */
 function wireOwnerHandlers(peer) {
+  // Media calls from viewers (they dial us with their mic/cam)
   peer.on("call", (call) => {
     const answerStream = new MediaStream();
     if (state.screenStream) state.screenStream.getTracks().forEach((t) => answerStream.addTrack(t));
@@ -117,8 +124,12 @@ function wireOwnerHandlers(peer) {
       if (state.answeredCalls.get(call.peer) === call) state.answeredCalls.delete(call.peer);
       removeViewerFeed(call.peer);
     });
+
+    // Late joiners get the webcam stream too, if it's already on
+    if (state.ownerCamStream) sendHostCamTo(call.peer);
   });
 
+  // Data connections for chat
   peer.on("connection", (conn) => {
     state.dataConns.set(conn.peer, conn);
     conn.on("data", (d) => {
@@ -135,6 +146,8 @@ function wireOwnerHandlers(peer) {
       removeViewerFeed(conn.peer);
       const dead = state.answeredCalls.get(conn.peer);
       if (dead) { try { dead.close(); } catch (_) {} state.answeredCalls.delete(conn.peer); }
+      const camDone = state.hostCamCalls.get(conn.peer);
+      if (camDone) { try { camDone.close(); } catch (_) {} state.hostCamCalls.delete(conn.peer); }
       if (conn._viewerName) sysMsg(`${conn._viewerName} left`);
     });
   });
@@ -155,7 +168,7 @@ async function startSharing() {
     });
     state.screenStream = stream;
     state.sharing = true;
-  clearInterval(state.shareWatch);
+    clearInterval(state.shareWatch);
 
     // main preview
     const v = $("mainVideo");
@@ -186,9 +199,12 @@ async function startSharing() {
     state.answeredCalls.forEach((call) => { try { call.close(); } catch (_) {} });
     state.answeredCalls.clear();
 
+    // Protected-content detection: is the captured video actually black?
+    watchForBlackCapture(v);
+
     stream.getVideoTracks()[0].addEventListener("ended", () => stopSharing());
     // safety net: some browsers don't fire 'ended' on the local track after stop()
-    clearInterval(state.shareWatch); 
+    clearInterval(state.shareWatch);
     state.shareWatch = setInterval(() => {
       const t = state.screenStream && state.screenStream.getVideoTracks()[0];
       if (!t || t.readyState !== "live") stopSharing();
@@ -196,6 +212,38 @@ async function startSharing() {
   } catch (err) {
     if (err && err.name !== "NotAllowedError") toast("Screen share failed: " + err.name, "warn");
   }
+}
+
+/* ----- DRM / overlay capture fix (the web-side equivalent of
+   app.disableHardwareAcceleration(): we can't call it from a page, but we
+   can detect the black-capture symptom and guide the host to the two real
+   fixes — Entire-screen capture, or Chrome's software-rendering toggle. ----- */
+function watchForBlackCapture(videoEl) {
+  setTimeout(async () => {
+    if (!state.sharing || !state.screenStream || !videoEl.videoWidth) return;
+    const canvas = document.createElement("canvas");
+    canvas.width = 160; canvas.height = 90;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    const grabAvg = () => {
+      try {
+        ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+        const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+        let sum = 0, n = 0;
+        for (let p = 0; p < data.length; p += 40) { sum += data[p] + data[p + 1] + data[p + 2]; n += 3; }
+        return { avg: sum / n, sig: Array.from(data.slice(0, 360)).join(",") };
+      } catch (_) { return null; }
+    };
+    const a = grabAvg(); await new Promise(r => setTimeout(r, 350));
+    const b = grabAvg(); await new Promise(r => setTimeout(r, 350));
+    const c = grabAvg();
+    if (!a || !b || !c) return;
+    const allBlack = a.avg < 6 && b.avg < 6 && c.avg < 6;
+    const frozen = a.sig === b.sig && b.sig === c.sig;
+    if (allBlack || frozen) {
+      toast("⚠️ The share looks black/frozen — protected content (Netflix, Prime…) is hidden from capture. Open “Streaming protected content?” for the fix.", "warn");
+      $("protPanel").classList.remove("hidden");
+    }
+  }, 2500);
 }
 
 function stopSharing() {
@@ -217,8 +265,53 @@ function stopSharing() {
   toast("Screen sharing stopped");
 }
 
+/* ---------- owner webcam (host camera) ---------- */
+$("camBtn").addEventListener("click", toggleOwnerCam);
+
+async function toggleOwnerCam() {
+  if (state.role !== "owner") return toggleViewerCam();
+  if (!state.ownerCamStream) {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 } } });
+      state.ownerCamStream = stream;
+      buildSelfThumb(stream.getVideoTracks()[0], "You");
+      $("camBtn").classList.remove("turned-off");
+      $("camBtn").classList.add("turned-on");
+      $("camBtn").title = "Turn camera off";
+      // deliver to every connected viewer
+      const ids = new Set([...state.answeredCalls.keys(), ...state.dataConns.keys()]);
+      ids.forEach(sendHostCamTo);
+      broadcast({ type: "hostcam", on: true });
+      toast("Camera on — everyone can now see you", "ok");
+    } catch (_) {
+      toast("Camera unavailable (permission denied or in use)", "warn");
+    }
+  } else {
+    state.ownerCamStream.getTracks().forEach((t) => t.stop());
+    state.ownerCamStream = null;
+    state.hostCamCalls.forEach((call) => { try { call.close(); } catch (_) {} });
+    state.hostCamCalls.clear();
+    removeHostCamThumb("You");
+    $("camBtn").classList.add("turned-off");
+    $("camBtn").classList.remove("turned-on");
+    $("camBtn").title = "Camera";
+    broadcast({ type: "hostcam", on: false });
+    toast("Camera off");
+  }
+}
+
+function sendHostCamTo(viewerPeerId) {
+  if (!state.ownerCamStream || !state.peer) return;
+  const prev = state.hostCamCalls.get(viewerPeerId);
+  if (prev && prev.open) { try { prev.close(); } catch (_) {} }
+  try {
+    const call = state.peer.call(viewerPeerId, state.ownerCamStream);
+    state.hostCamCalls.set(viewerPeerId, call);
+  } catch (_) {}
+}
+
 /* ---------- viewer feeds (owner side thumbnails) ---------- */
-const viewerFeeds = new Map(); // peerId -> { thumbEl, videoEl }
+const viewerFeeds = new Map(); // peerId -> { thumbEl, videoEl, tracks }
 function addViewerFeed(peerId, stream) {
   removeViewerFeed(peerId);
   const thumb = document.createElement("div");
@@ -239,6 +332,19 @@ function addViewerFeed(peerId, stream) {
   $("thumbStack").classList.remove("hidden");
   viewerFeeds.set(peerId, { thumbEl: thumb, videoEl: video });
   startTimer();
+
+  // If the guest's camera is (or becomes) off, drop the tile instead of
+  // showing an empty black rectangle.
+  const vTrack = stream.getVideoTracks()[0];
+  if (!vTrack || vTrack.readyState === "ended") { removeViewerFeed(peerId); return; }
+  const idleOrMuted = () => { if (vTrack.muted || !vTrack.enabled) removeViewerFeed(peerId); };
+  const active = () => {
+    if (vTrack.muted === false && vTrack.enabled) addViewerFeed(peerId, stream);
+  };
+  vTrack.addEventListener("mute", idleOrMuted);
+  vTrack.addEventListener("unmute", () => { if (!viewerFeeds.has(peerId)) active(); });
+  vTrack.addEventListener("ended", () => removeViewerFeed(peerId));
+  if (vTrack.muted || !vTrack.enabled) removeViewerFeed(peerId);
 }
 function removeViewerFeed(peerId) {
   const f = viewerFeeds.get(peerId);
@@ -246,12 +352,71 @@ function removeViewerFeed(peerId) {
   f.videoEl.srcObject = null;
   f.thumbEl.remove();
   viewerFeeds.delete(peerId);
-  if (viewerFeeds.size === 0) $("thumbStack").classList.add("hidden");
+  if (viewerFeeds.size === 0 && document.querySelectorAll(".thumb").length === 0) {
+    $("thumbStack").classList.add("hidden");
+  }
+}
+
+/* ============================================================
+   OWNER-CAM FEED (viewer side) — host webcam picture-in-picture
+   ============================================================ */
+function addHostCamThumb(stream, label) {
+  const existing = document.querySelectorAll(".thumb.hostcam").length;
+  if (existing > 0) return;
+  const thumb = document.createElement("div");
+  thumb.className = "thumb hostcam";
+  const video = document.createElement("video");
+  video.autoplay = true;
+  video.playsInline = true;
+  video.muted = false;
+  video.srcObject = stream;
+  thumb.appendChild(video);
+  const tag = document.createElement("span");
+  tag.className = "thumb-tag";
+  tag.textContent = label;
+  thumb.appendChild(tag);
+  $("thumbStack").appendChild(thumb);
+  $("thumbStack").classList.remove("hidden");
+}
+function removeHostCamThumb(label) {
+  if (label) {
+    document.querySelectorAll(".thumb.hostcam").forEach((el) => {
+      const tag = el.querySelector(".thumb-tag");
+      if (tag && tag.textContent === label) el.remove();
+    });
+  } else {
+    document.querySelectorAll(".thumb.hostcam").forEach((el) => el.remove());
+  }
+  if (document.querySelectorAll(".thumb").length === 0) $("thumbStack").classList.add("hidden");
 }
 
 /* ============================================================
    VIEWER
    ============================================================ */
+function wireViewerCallHandlers(peer) {
+  // Host dialing us with their webcam (picture-in-picture)
+  peer.on("call", (call) => {
+    if (state.hostCamCall && state.hostCamCall.open) {
+      try { state.hostCamCall.close(); } catch (_) {}
+    }
+    state.hostCamCall = call;
+    call.answer(new MediaStream());
+    call.on("stream", (remote) => {
+      if (remote.getVideoTracks().length >= 0 && !remote.getVideoTracks().length) removeHostCamThumb();
+      else addHostCamThumb(remote, "Host");
+      const t = remote.getVideoTracks()[0];
+      if (t) {
+        const drop = () => removeHostCamThumb();
+        t.addEventListener("ended", drop);
+        t.addEventListener("mute", drop);
+        t.addEventListener("unmute", () => addHostCamThumb(remote, "Host"));
+        if (t.muted || !t.enabled) removeHostCamThumb();
+      }
+    });
+    call.on("close", () => { if (state.hostCamCall === call) state.hostCamCall = null; removeHostCamThumb(); });
+  });
+}
+
 $("joinBtn").addEventListener("click", () => joinRoom($("codeInput").value));
 $("codeInput").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !$("joinBtn").disabled) joinRoom($("codeInput").value);
@@ -274,41 +439,61 @@ function joinRoom(rawCode) {
   startPeer(code, "viewer");
 }
 
-function buildSelfThumb() {
-  const track = state.ownStream && state.ownStream.getVideoTracks()[0];
-  if (!track) return;
+function buildSelfThumb(track, label) {
+  if (!track || track.readyState !== "live" || !track.enabled || track.muted) return null;
+  const existing = document.querySelector(".thumb.self");
+  if (existing) return existing;
   const thumb = document.createElement("div");
   thumb.className = "thumb self";
   const video = document.createElement("video");
   video.autoplay = true;
   video.playsInline = true;
-  video.muted = true; // never play own audio
-  video.srcObject = state.ownStream;
+  video.muted = true; // never echo your own mic/camera
+  video.srcObject = new MediaStream([track]);
   thumb.appendChild(video);
   const tag = document.createElement("span");
   tag.className = "thumb-tag";
-  tag.textContent = "You";
+  tag.textContent = label || "You";
   thumb.appendChild(tag);
   $("thumbStack").appendChild(thumb);
   $("thumbStack").classList.remove("hidden");
+
+  // no black boxes: hide/remove the tile whenever there is nothing to show
+  const gone = () => removeSelfThumb();
+  track.addEventListener("mute", gone);
+  track.addEventListener("ended", gone);
+  const back = () => { if (track.enabled && track.muted === false) buildSelfThumb(track, label); };
+  track.addEventListener("unmute", back);
+  return thumb;
+}
+function removeSelfThumb() {
+  const el = document.querySelector(".thumb.self");
+  if (el) el.remove();
+  if (document.querySelectorAll(".thumb").length === 0) $("thumbStack").classList.add("hidden");
 }
 
 function wireViewerJoin() {
-  // Grab local media BEFORE dialing so tracks are in the initial offer (muteable live)
+  // Microphone first, camera separately — a missing camera must never break
+  // the join, and an off-camera guest simply gets no self-video tile.
   const grab = async () => {
+    let micTrack = null, camTrack = null;
     try {
-      state.ownStream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 640 } },
+      micTrack = (await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true },
-      });
-    } catch (_) {
-      try {
-        state.ownStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        toast("Camera unavailable — joining with mic only", "warn");
-      } catch (_2) {
-        state.ownStream = new MediaStream();
-        toast("Joining without camera & mic — you'll still see/hear the host");
-      }
+      })).getAudioTracks()[0];
+    } catch (_) {}
+    try {
+      camTrack = (await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 } } })).getVideoTracks()[0];
+    } catch (_) {}
+    state.ownStream = new MediaStream();
+    if (micTrack) state.ownStream.addTrack(micTrack);
+    if (camTrack) {
+      state.ownStream.addTrack(camTrack);
+      buildSelfThumb(camTrack, "You");
+    } else if (micTrack) {
+      toast("No camera — you've joined audio-only (talk & listen works).", "warn");
+    } else {
+      toast("Joining without camera & mic — you'll still see/hear the host.");
     }
   };
 
@@ -333,7 +518,7 @@ function wireViewerJoin() {
     }, 1200);
     call.on("close", () => {
       if (state.call === call) state.call = null;
-      if (state.peer && !state.peer.destroyed && $("room") && !$("room").classList.contains("hidden")) {
+      if (state.peer && !state.peer.destroyed && !$("room").classList.contains("hidden")) {
         $("receiving").classList.remove("hidden");
       }
     });
@@ -347,9 +532,9 @@ function wireViewerJoin() {
     if (d.type === "chat") pushChat({ who: "Host", text: String(d.text) });
     else if (d.type === "sys") pushChat({ type: "sys", text: String(d.text) });
     else if (d.type === "recall") redial();
+    else if (d.type === "hostcam" && !d.on) removeHostCamThumb();
   });
   state.dataConn.on("close", () => {
-    console.log("[viewer] dataConn closed");
     if (!$("room").classList.contains("hidden")) roomEnded("The host closed the room.");
   });
 
@@ -360,10 +545,7 @@ function wireViewerJoin() {
     dial();
   };
 
-  grab().then(() => {
-    buildSelfThumb();
-    dial();
-  });
+  grab().then(dial);
 }
 
 function onHostStream(remote) {
@@ -378,13 +560,24 @@ function onHostStream(remote) {
 }
 
 /* ============================================================
+   VIEWER CAMERA TOGGLE (viewer), local only
+   ============================================================ */
+function toggleViewerCam() {
+  const track = state.ownStream && state.ownStream.getVideoTracks()[0];
+  if (!track) { toast("No camera in this session — see and hear the host without your webcam.", "warn"); return; }
+  track.enabled = !track.enabled;
+  $("camBtn").classList.toggle("turned-off", !track.enabled);
+  if (track.enabled) buildSelfThumb(track, "You"); else removeSelfThumb();
+  toast(track.enabled ? "Camera on" : "Camera off");
+}
+
+/* ============================================================
    ROOM ENTRY / HUD
    ============================================================ */
 function enterRoomUI() {
   show("room");
   const isOwner = state.role === "owner";
   $("shareBtn").classList.toggle("hidden", !isOwner);
-  $("camBtn").classList.toggle("hidden", isOwner);
   $("roomCodeBig").textContent = formatCode(state.roomCode);
   $("receiving").classList.add("hidden");
 
@@ -422,6 +615,7 @@ function roomEnded(title) {
   show("ended");
   $("endedTitle").textContent = title || "You left the room";
 }
+
 $("hangupBtn").addEventListener("click", () => {
   broadcast({ type: "sys", text: `${state.name} left the room` });
   roomEnded("You left the room");
@@ -440,6 +634,8 @@ $("copyCodeBtn").addEventListener("click", async () => {
   } catch (_) { toast("Copy failed — grab it manually", "warn"); }
 });
 
+$("protHelpBtn").addEventListener("click", () => $("protPanel").classList.toggle("hidden"));
+
 function teardown() {
   state.dataConns.forEach((c) => { try { c.close(); } catch (_) {} });
   state.dataConns.clear();
@@ -447,10 +643,15 @@ function teardown() {
   [...state.answeredCalls.keys()].forEach(removeViewerFeed);
   state.answeredCalls.forEach((c) => { try { c.close(); } catch (_) {} });
   state.answeredCalls.clear();
+  state.hostCamCalls.forEach((c) => { try { c.close(); } catch (_) {} });
+  state.hostCamCalls.clear();
+  if (state.hostCamCall) { try { state.hostCamCall.close(); } catch (_) {} state.hostCamCall = null; }
   if (state.call) { try { state.call.close(); } catch (_) {} state.call = null; }
   if (state.screenStream) state.screenStream.getTracks().forEach((t) => t.stop());
   state.screenStream = null;
   state.micTrack = null;
+  if (state.ownerCamStream) state.ownerCamStream.getTracks().forEach((t) => t.stop());
+  state.ownerCamStream = null;
   if (state.ownStream) state.ownStream.getTracks().forEach((t) => t.stop());
   state.ownStream = null;
   stopTimer();
@@ -458,6 +659,7 @@ function teardown() {
   state.sharing = false;
   if (state.peer && !state.peer.destroyed) { try { state.peer.destroy(); } catch (_) {} }
   state.peer = null;
+  document.exitFullscreen().catch(() => {});
   $("mainVideo").srcObject = null;
   $("chatLog").innerHTML = "";
   $("chatPanel").classList.add("hidden");
@@ -465,8 +667,12 @@ function teardown() {
   $("thumbStack").classList.add("hidden");
   $("shareBtn").classList.remove("turned-on");
   $("micBtn").classList.remove("turned-off");
-  $("camBtn").classList.remove("turned-off");
-  selfVolEl = null;
+  $("camBtn").classList.remove("turned-off", "turned-on");
+  $("camBtn").title = "Camera";
+  $("stage").classList.remove("immersive");
+  $("fsExitBtn").classList.add("hidden");
+  $("fsTapHint").classList.add("hidden");
+  document.documentElement.classList.remove("fs-on");
   state.outMuted = false;
   $("volumeSlider").value = 85;
   $("volIcon").innerHTML = VOL_ON;
@@ -478,9 +684,8 @@ function teardown() {
    ============================================================ */
 const VOL_ON = '<path d="M11 5 6 9H3v6h3l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18 6a8.5 8.5 0 0 1 0 12"/>';
 const VOL_OFF = '<path d="M11 5 6 9H3v6h3l5 4z"/><line x1="16" y1="9" x2="22" y2="15"/><line x1="22" y1="9" x2="16" y2="15"/>';
-let selfVolEl = null; // viewer's self thumb video (kept muted)
 
-// mic toggle
+// mic toggle (owner: talkover mic over the shared screen; viewer: outgoing mic)
 $("micBtn").addEventListener("click", () => {
   const track =
     (state.role === "owner"
@@ -492,26 +697,18 @@ $("micBtn").addEventListener("click", () => {
   toast(track.enabled ? "Microphone on" : "Microphone muted");
 });
 
-// camera toggle (viewer)
-$("camBtn").addEventListener("click", () => {
-  const track = state.ownStream && state.ownStream.getVideoTracks()[0];
-  if (!track) { toast("You joined without a camera — permissions blocked it", "warn"); return; }
-  track.enabled = !track.enabled;
-  $("camBtn").classList.toggle("turned-off", !track.enabled);
-});
-
-// volume dock
+/* ---------- volume dock (both roles: incoming audio) ---------- */
 function applyMuteState() {
   const muted = state.outMuted;
   $("volIcon").innerHTML = muted ? VOL_OFF : VOL_ON;
   if (state.role === "viewer") $("mainVideo").muted = muted;
-  viewerFeeds.forEach((f) => (f.videoEl.muted = muted));
+  if (state.role === "owner") viewerFeeds.forEach((f) => (f.videoEl.muted = muted));
 }
 $("volumeSlider").addEventListener("input", (e) => {
   const vol = e.target.value / 100;
-  if (state.role === "viewer") { $("mainVideo").volume = vol; }
+  if (state.role === "viewer") $("mainVideo").volume = vol;
   viewerFeeds.forEach((f) => (f.videoEl.volume = vol));
-  if (vol === 0) { state.outMuted = true; } else { state.outMuted = false; if (selfVolEl) selfVolEl.muted = true; }
+  state.outMuted = vol === 0;
   applyMuteState();
 });
 $("muteOutBtn").addEventListener("click", () => {
@@ -520,10 +717,45 @@ $("muteOutBtn").addEventListener("click", () => {
   toast(state.outMuted ? "Muted" : "Unmuted");
 });
 
-// fullscreen on double click
-$("stage").addEventListener("dblclick", () => {
-  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
-  else $("stage").requestFullscreen().catch(() => {});
+/* ============================================================
+   FULLSCREEN (immersive) — completely borderless, button-free.
+   One tap reveals the exit control; another tap on it leaves.
+   ============================================================ */
+$("fsBtn").addEventListener("click", () => {
+  if (document.fullscreenElement) return;
+  const el = $("stage");
+  el.requestFullscreen().then(() => {
+    el.classList.add("immersive");
+    document.documentElement.classList.add("fs-on");
+  }).catch(() => toast("Fullscreen blocked by the browser", "warn"));
+});
+
+// click anywhere in the immersive stage to reveal the exit button
+$("stage").addEventListener("click", () => {
+  if (!(document.fullscreenElement === $("stage"))) return;
+  if (!$("stage").classList.contains("immersive")) return;
+  if ($("fsExitBtn").classList.contains("hidden")) {
+    $("fsExitBtn").classList.remove("hidden");
+    $("fsTapHint").classList.remove("hidden");
+    clearTimeout(state.fsHintTimer);
+    state.fsHintTimer = setTimeout(() => {
+      $("fsExitBtn").classList.add("hidden");
+      $("fsTapHint").classList.add("hidden");
+    }, 4000);
+  }
+});
+
+$("fsExitBtn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  document.exitFullscreen().catch(() => {});
+});
+
+document.addEventListener("fullscreenchange", () => {
+  const active = document.fullscreenElement === $("stage");
+  $("stage").classList.toggle("immersive", active);
+  document.documentElement.classList.toggle("fs-on", active);
+  $("fsExitBtn").classList.add("hidden");
+  $("fsTapHint").classList.add("hidden");
 });
 
 /* ============================================================
@@ -576,9 +808,7 @@ $("chatForm").addEventListener("submit", (e) => {
 if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
   toast("⚠️ This browser can't share screens — use desktop Chrome/Edge/Brave.", "warn");
 }
-window.addEventListener("beforeunload", teardown);
-// self thumb ring styling helper (viewer keeps own audio silent)
-new MutationObserver(() => {
-  const t = document.querySelector(".thumb.self video");
-  selfVolEl = t || null;
-}).observe($("thumbStack"), { childList: true });
+window.addEventListener("beforeunload", () => { try { teardown(); } catch (_) {} });
+
+// exposed for debugging in devtools / automated tests
+window.__roomcastState = state;

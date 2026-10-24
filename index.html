@@ -53,7 +53,7 @@
           <label for="nameInput">Your name</label>
           <input id="nameInput" type="text" maxlength="24" placeholder="Guest" />
         </div>
-        <p class="hint">Tip: hosts can send screen + microphone audio. Guests can join with their camera &amp; mic for two-way talk.</p>
+        <p class="hint">Tip: hosts can send screen + microphone audio and add a webcam. Guests only need a mic — camera is optional for two-way talk.</p>
       </div>
     </div>
 
@@ -79,6 +79,17 @@
           <p id="roomCodeBig" class="ow-code">—ROOM—</p>
           <button id="copyCodeBtn" class="btn btn-ghost small">Copy code</button>
           <p class="ow-hint">Share this code with your audience. Start sharing to broadcast.</p>
+          <button id="protHelpBtn" class="ow-more">Streaming protected content (Netflix, etc.)?</button>
+          <div id="protPanel" class="prot-panel hidden">
+            <p class="prot-title">If the shared video comes out <b>black</b> or stops, that's Chromium's content protection hiding the pixels from capture. Fix it on your machine:</p>
+            <ol>
+              <li><b>Preferred:</b> when the share picker opens, choose <b>Entire screen</b> — not the tab — and keep the video <b>windowed</b> (not fullscreen). Whole-display capture usually gets the real pixels.</li>
+              <li><b>If it's still black</b>, apply the same fix the Netflix-capture trick uses — send rendering down the <i>software</i> path so content isn't shown on protected GPU overlay planes:<br>
+              open <code>chrome://settings/system</code> → switch off <b>“Use graphics acceleration when available”</b> → <b>Relaunch</b> → share again.</li>
+              <li>Then pick <b>Entire screen</b> in the picker and tick <b>Share audio</b> for the sound.</li>
+            </ol>
+            <p class="prot-note">That toggle is the browser-side equivalent of <code>app.disableHardwareAcceleration()</code> — the “one line” fix from that article. Web pages can't call it directly, so we apply it in your own Chrome.</p>
+          </div>
         </div>
 
         <!-- Receiving state -->
@@ -123,7 +134,17 @@
           <button id="chatBtn" class="ctl" title="Chat">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5c-1.2 0-2.4-.2-3.4-.7L3 21l1.7-4.1A8.5 8.5 0 1 1 21 11.5z"/></svg>
           </button>
+          <button id="fsBtn" class="ctl" title="Fullscreen">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+          </button>
         </div>
+
+        <!-- Fullscreen exit (revealed by one tap while immersive) -->
+        <button id="fsExitBtn" class="fs-exit hidden" title="Exit fullscreen">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4v5H4M15 20v-5h5M4 15h5v5M20 9h-5V4"/></svg>
+          Exit fullscreen
+        </button>
+        <p id="fsTapHint" class="fs-tap-hint hidden">Tap once more to exit</p>
 
         <!-- Chat panel -->
         <aside id="chatPanel" class="chat-panel hidden">
